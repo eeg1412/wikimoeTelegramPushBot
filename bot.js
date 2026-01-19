@@ -94,6 +94,20 @@ class TelegramRSSBot {
     console.log(`⏰ 扫描间隔: ${this.scanInterval} 分钟`)
   }
 
+  // 检查是否为管理员或群主
+  async isAdmin(chatId, userId) {
+    // 只在配置的群组中处理
+    if (!this.groupIds.includes(chatId.toString())) return false
+
+    try {
+      const chatMember = await this.bot.getChatMember(chatId, userId)
+      return ['creator', 'administrator'].includes(chatMember.status)
+    } catch (error) {
+      console.error('❌ 权限检查失败:', error)
+      return false
+    }
+  }
+
   // 初始化机器人
   async init() {
     try {
@@ -279,6 +293,32 @@ class TelegramRSSBot {
     }
   }
 
+  // 获取 RSS 内容 (仅用于 /rss 查询)
+  async getRSSContent(url) {
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(path.join(__dirname, 'rss-worker.js'))
+
+      const timeout = setTimeout(() => {
+        worker.terminate()
+        resolve({ success: false, error: '获取超时' })
+      }, 30000)
+
+      worker.postMessage({ url, lastArticleId: null, lastScanTime: null })
+
+      worker.on('message', result => {
+        clearTimeout(timeout)
+        worker.terminate()
+        resolve(result)
+      })
+
+      worker.on('error', error => {
+        clearTimeout(timeout)
+        worker.terminate()
+        resolve({ success: false, error: error.message })
+      })
+    })
+  }
+
   // 处理单个RSS源
   async processRSSFeed(url, lastScanTime) {
     return new Promise((resolve, reject) => {
@@ -394,27 +434,18 @@ class TelegramRSSBot {
   setupBotCommands() {
     // 立即刷新指令
     this.bot.onText(/\/reflush/, async msg => {
+      if (msg.chat.type === 'private') return // 忽略私聊
+
       const chatId = msg.chat.id
       const userId = msg.from.id
 
       try {
-        // 检查是否在私聊中（私聊默认为管理员，或者根据需求调整）
-        if (msg.chat.type === 'private') {
-          // 如果需要限制私聊，可以在这里加逻辑
-        } else {
-          // 在群组中检查权限
-          const chatMember = await this.bot.getChatMember(chatId, userId)
-          const isAdmin = ['creator', 'administrator'].includes(
-            chatMember.status
+        if (!(await this.isAdmin(chatId, userId))) {
+          await this.bot.sendMessage(
+            chatId,
+            '❌ 只有群主或管理员可以使用此指令'
           )
-
-          if (!isAdmin) {
-            await this.bot.sendMessage(
-              chatId,
-              '❌ 只有群主或管理员可以使用此指令'
-            )
-            return
-          }
+          return
         }
 
         if (this.isScanning) {
@@ -427,6 +458,93 @@ class TelegramRSSBot {
         await this.bot.sendMessage(chatId, '✅ RSS刷新完成！')
       } catch (error) {
         console.error('❌ 指令处理失败:', error)
+      }
+    })
+
+    // RSS 列表查询指令
+    this.bot.onText(/\/rss\s+(.+)/, async (msg, match) => {
+      if (msg.chat.type === 'private') return // 忽略私聊
+
+      const chatId = msg.chat.id
+      const userId = msg.from.id
+      const domain = match[1].trim()
+
+      try {
+        if (!(await this.isAdmin(chatId, userId))) {
+          await this.bot.sendMessage(
+            chatId,
+            '❌ 只有群主或管理员可以使用此指令'
+          )
+          return
+        }
+
+        const matchingUrls = this.rssUrls.filter(url => url.includes(domain))
+        if (matchingUrls.length === 0) {
+          await this.bot.sendMessage(
+            chatId,
+            `❌ 未能在配置中找到包含 "${domain}" 的 RSS 源`
+          )
+          return
+        }
+
+        await this.bot.sendMessage(
+          chatId,
+          `🔍 正在查询包含 "${domain}" 的 RSS 源，请稍候...`
+        )
+
+        for (const url of matchingUrls) {
+          try {
+            // 复用 Worker 获取内容 (传递 null 的 lastArticleId 以获取所有内容)
+            const result = await this.getRSSContent(url)
+            if (result.success) {
+              const { feed } = result
+              let message = `━━━━━━━━━━━━━━\n`
+              message += `📖 *${feed.title || '未知 RSS 源'}*\n`
+              message += `━━━━━━━━━━━━━━\n\n`
+
+              // 确保按时间倒序排列（最新的在前面），并只取前 10 条
+              const items = feed.items
+                .sort((a, b) => {
+                  const dateA = new Date(a.isoDate || a.pubDate || 0)
+                  const dateB = new Date(b.isoDate || b.pubDate || 0)
+                  return dateB - dateA
+                })
+                .slice(0, 10)
+
+              items.forEach((item, index) => {
+                const title = cutTextByLength(item.title || '无标题', 100)
+                const link = item.link || ''
+                const date = item.isoDate || item.pubDate
+                const dateStr = date
+                  ? formatServerTime(new Date(date)).split(' ')[0] // 只取日期部分使列表整洁
+                  : '未知日期'
+
+                message += `[${dateStr}] [${title}](${link})\n`
+              })
+
+              if (feed.items.length > 10) {
+                message += `\n... 以及其他 ${feed.items.length - 10} 篇文章`
+              }
+
+              await this.bot.sendMessage(chatId, message, {
+                parse_mode: 'Markdown',
+                disable_web_page_preview: true
+              })
+            } else {
+              await this.bot.sendMessage(
+                chatId,
+                `❌ 获取 RSS 源失败: ${url}\n原因: ${result.error}`
+              )
+            }
+          } catch (error) {
+            await this.bot.sendMessage(
+              chatId,
+              `❌ 处理 RSS 源时发生错误: ${url}\n${error.message}`
+            )
+          }
+        }
+      } catch (error) {
+        console.error('❌ /rss 指令处理失败:', error)
       }
     })
 
