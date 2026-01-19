@@ -233,6 +233,7 @@ class TelegramRSSBot {
       return
     }
 
+    const previousScanTime = this.stats.lastScanTime // 获取本次扫描前的最后一次扫描时间
     this.isScanning = true
     console.log('🔍 开始扫描RSS源...')
     this.stats.totalScans++
@@ -247,7 +248,10 @@ class TelegramRSSBot {
           break
         }
         try {
-          const newArticlesCount = await this.processRSSFeed(url)
+          const newArticlesCount = await this.processRSSFeed(
+            url,
+            previousScanTime
+          )
           totalNewArticles += newArticlesCount
 
           // 避免请求过快
@@ -276,7 +280,7 @@ class TelegramRSSBot {
   }
 
   // 处理单个RSS源
-  async processRSSFeed(url) {
+  async processRSSFeed(url, lastScanTime) {
     return new Promise((resolve, reject) => {
       const worker = new Worker(path.join(__dirname, 'rss-worker.js'))
       const lastArticleId = this.lastArticles.get(url)
@@ -287,7 +291,7 @@ class TelegramRSSBot {
         reject(new Error('RSS获取超时'))
       }, 30000) // 30秒超时
 
-      worker.postMessage({ url, lastArticleId })
+      worker.postMessage({ url, lastArticleId, lastScanTime })
 
       worker.on('message', async result => {
         clearTimeout(timeout)
@@ -388,6 +392,44 @@ class TelegramRSSBot {
 
   // 设置机器人命令
   setupBotCommands() {
+    // 立即刷新指令
+    this.bot.onText(/\/reflush/, async msg => {
+      const chatId = msg.chat.id
+      const userId = msg.from.id
+
+      try {
+        // 检查是否在私聊中（私聊默认为管理员，或者根据需求调整）
+        if (msg.chat.type === 'private') {
+          // 如果需要限制私聊，可以在这里加逻辑
+        } else {
+          // 在群组中检查权限
+          const chatMember = await this.bot.getChatMember(chatId, userId)
+          const isAdmin = ['creator', 'administrator'].includes(
+            chatMember.status
+          )
+
+          if (!isAdmin) {
+            await this.bot.sendMessage(
+              chatId,
+              '❌ 只有群主或管理员可以使用此指令'
+            )
+            return
+          }
+        }
+
+        if (this.isScanning) {
+          await this.bot.sendMessage(chatId, '⏳ RSS扫描已经在进行中...')
+          return
+        }
+
+        await this.bot.sendMessage(chatId, '🔍 正在立即刷新获取RSS...')
+        await this.scanRSSFeeds()
+        await this.bot.sendMessage(chatId, '✅ RSS刷新完成！')
+      } catch (error) {
+        console.error('❌ 指令处理失败:', error)
+      }
+    })
+
     // 错误处理
     this.bot.on('polling_error', error => {
       console.error('❌ Telegram轮询错误:', error)
