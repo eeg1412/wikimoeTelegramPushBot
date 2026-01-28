@@ -9,13 +9,14 @@ const parser = new Parser({
 })
 
 parentPort.on('message', async data => {
-  const { url, lastArticleId, lastScanTime } = data
+  const { url, lastArticleId, lastArticlePubDate, lastScanTime } = data
 
   try {
     console.log(`🧵 Worker正在获取: ${url}`)
 
     const feed = await parser.parseURL(url)
     const newArticles = []
+    const lastPubDate = lastArticlePubDate ? new Date(lastArticlePubDate) : null
     const lastScanDate = lastScanTime ? new Date(lastScanTime) : null
 
     // 查找新文章
@@ -23,16 +24,44 @@ parentPort.on('message', async data => {
       const articleId = item.guid || item.link || item.title
       const itemDate = item.isoDate ? new Date(item.isoDate) : null
 
-      // 如果有最后扫描时间，且文章时间早于或等于最后扫描时间，则不再视为新文章
-      if (lastScanDate && itemDate && itemDate <= lastScanDate) {
-        break
-      }
-
-      if (!lastArticleId || articleId !== lastArticleId) {
-        newArticles.push(item)
+      if (lastPubDate) {
+        // 新版逻辑：判断依据改为记录在该 RSS 源最新文章发布时间之后的文章且 URL 不是记录的 URL
+        if (itemDate && itemDate > lastPubDate && articleId !== lastArticleId) {
+          newArticles.push(item)
+        } else if (
+          articleId === lastArticleId ||
+          (itemDate && itemDate <= lastPubDate)
+        ) {
+          // 找到已知文章或比已知最晚时间更早的文章，停止搜寻
+          break
+        }
       } else {
-        break // 找到已知文章，停止搜索
+        // 旧版兼容逻辑：旧版只记录了 URL，此时按照现有逻辑根据 lastScanTime 判断新的文章
+        if (lastScanDate && itemDate && itemDate <= lastScanDate) {
+          break
+        }
+
+        if (!lastArticleId || articleId !== lastArticleId) {
+          newArticles.push(item)
+        } else {
+          break // 找到已知文章，停止搜索
+        }
       }
+    }
+
+    // 获取最新一篇文章的信息供记录
+    const latestItem = feed.items[0]
+    let latestArticleId = null
+    let latestArticlePubDate = null
+
+    if (latestItem) {
+      latestArticleId = latestItem.guid || latestItem.link || latestItem.title
+      const pubDate = latestItem.isoDate
+        ? new Date(latestItem.isoDate)
+        : new Date()
+      // 如果发布时间超过系统当前时间则替换为系统当前时间
+      const now = new Date()
+      latestArticlePubDate = (pubDate > now ? now : pubDate).toISOString()
     }
 
     // 返回结果
@@ -44,9 +73,8 @@ parentPort.on('message', async data => {
         items: feed.items
       },
       newArticles,
-      latestArticleId: feed.items[0]
-        ? feed.items[0].guid || feed.items[0].link || feed.items[0].title
-        : null
+      latestArticleId,
+      latestArticlePubDate
     })
   } catch (error) {
     parentPort.postMessage({

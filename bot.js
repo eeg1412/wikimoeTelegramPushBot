@@ -303,7 +303,12 @@ class TelegramRSSBot {
         resolve({ success: false, error: '获取超时' })
       }, 30000)
 
-      worker.postMessage({ url, lastArticleId: null, lastScanTime: null })
+      worker.postMessage({
+        url,
+        lastArticleId: null,
+        lastArticlePubDate: null,
+        lastScanTime: null
+      })
 
       worker.on('message', result => {
         clearTimeout(timeout)
@@ -323,7 +328,17 @@ class TelegramRSSBot {
   async processRSSFeed(url, lastScanTime) {
     return new Promise((resolve, reject) => {
       const worker = new Worker(path.join(__dirname, 'rss-worker.js'))
-      const lastArticleId = this.lastArticles.get(url)
+      const lastArticleData = this.lastArticles.get(url)
+      let lastArticleId = null
+      let lastArticlePubDate = null
+
+      // 兼容旧版：如果存的是字符串，则作为 ID，PubDate 为空
+      if (typeof lastArticleData === 'string') {
+        lastArticleId = lastArticleData
+      } else if (lastArticleData && typeof lastArticleData === 'object') {
+        lastArticleId = lastArticleData.id
+        lastArticlePubDate = lastArticleData.pubDate
+      }
 
       // 设置超时
       const timeout = setTimeout(() => {
@@ -331,23 +346,32 @@ class TelegramRSSBot {
         reject(new Error('RSS获取超时'))
       }, 30000) // 30秒超时
 
-      worker.postMessage({ url, lastArticleId, lastScanTime })
+      worker.postMessage({
+        url,
+        lastArticleId,
+        lastArticlePubDate,
+        lastScanTime
+      })
 
       worker.on('message', async result => {
         clearTimeout(timeout)
 
         if (result.success) {
           try {
-            const { newArticles, latestArticleId, feed } = result
+            const { newArticles, latestArticleId, latestArticlePubDate, feed } =
+              result
 
             if (newArticles.length > 0) {
               console.log(
                 `📰 发现 ${newArticles.length} 篇新文章来自: ${feed.title}`
               )
 
-              // 记录最新文章ID
+              // 记录最新文章ID和发布时间
               if (latestArticleId) {
-                this.lastArticles.set(url, latestArticleId)
+                this.lastArticles.set(url, {
+                  id: latestArticleId,
+                  pubDate: latestArticlePubDate
+                })
               }
 
               // 发送新文章到群组（按时间顺序，最新的在前面）
