@@ -35,6 +35,11 @@ function removeLineBreaks(str) {
   return str.replace(/[\r\n]+/g, '')
 }
 
+function parseBoolean(value, defaultValue = false) {
+  if (typeof value === 'undefined') return defaultValue
+  return String(value).toLowerCase() === 'true'
+}
+
 class TelegramRSSBot {
   constructor() {
     // 初始化配置
@@ -47,6 +52,15 @@ class TelegramRSSBot {
       ? process.env.GROUP_IDS.split(',').map(id => id.trim())
       : []
     this.dataFile = process.env.DATA_FILE || 'rss_data.json'
+    this.ollamaEnabled = parseBoolean(process.env.OLLAMA_ENABLED, false)
+    this.ollamaApiUrl = (process.env.OLLAMA_API_URL || '').trim()
+    this.ollamaModel = (process.env.OLLAMA_MODEL || '').trim()
+    this.ollamaSystemPrompt =
+      process.env.OLLAMA_SYSTEM_PROMPT || '你是一个有用的助手。'
+    this.ollamaTimeoutMs = parseInt(process.env.OLLAMA_TIMEOUT_MS) || 30000
+    this.ollamaQueueMaxSize = 50
+    this.botId = null
+    this.botUsername = ''
 
     // 初始化组件
     this.bot = new TelegramBot(this.botToken, { polling: true })
@@ -54,6 +68,8 @@ class TelegramRSSBot {
     this.intervalId = null
     this.isScanning = false
     this.isStop = false
+    this.ollamaQueue = []
+    this.isOllamaProcessing = false
     this.stats = {
       totalScans: 0,
       totalArticlesSent: 0,
@@ -69,6 +85,13 @@ class TelegramRSSBot {
     this.sendToGroups = this.sendToGroups.bind(this)
     this.setupBotCommands = this.setupBotCommands.bind(this)
     this.startScheduler = this.startScheduler.bind(this)
+    this.initBotProfile = this.initBotProfile.bind(this)
+    this.isBotMentioned = this.isBotMentioned.bind(this)
+    this.extractMentionPrompt = this.extractMentionPrompt.bind(this)
+    this.chatWithOllama = this.chatWithOllama.bind(this)
+    this.handleMentionMessage = this.handleMentionMessage.bind(this)
+    this.enqueueOllamaTask = this.enqueueOllamaTask.bind(this)
+    this.processOllamaQueue = this.processOllamaQueue.bind(this)
 
     console.log('🤖 Telegram RSS Bot 初始化中...')
     this.validateConfig()
@@ -88,10 +111,23 @@ class TelegramRSSBot {
       throw new Error('❌ 缺少 GROUP_IDS 环境变量')
     }
 
+    if (this.ollamaEnabled) {
+      if (!this.ollamaApiUrl) {
+        throw new Error('❌ 已开启 OLLAMA_ENABLED，但缺少 OLLAMA_API_URL')
+      }
+      if (!this.ollamaModel) {
+        throw new Error('❌ 已开启 OLLAMA_ENABLED，但缺少 OLLAMA_MODEL')
+      }
+    }
+
     console.log('✅ 配置验证通过')
     console.log(`📡 RSS源数量: ${this.rssUrls.length}`)
     console.log(`👥 群组数量: ${this.groupIds.length}`)
     console.log(`⏰ 扫描间隔: ${this.scanInterval} 分钟`)
+    console.log(`🧠 Ollama聊天: ${this.ollamaEnabled ? '已开启' : '已关闭'}`)
+    if (this.ollamaEnabled) {
+      console.log(`🧾 Ollama队列上限: ${this.ollamaQueueMaxSize}`)
+    }
   }
 
   // 检查是否为管理员或群主
@@ -112,6 +148,7 @@ class TelegramRSSBot {
   async init() {
     try {
       await this.loadData()
+      await this.initBotProfile()
       this.setupBotCommands()
       this.startScheduler()
 
@@ -124,6 +161,19 @@ class TelegramRSSBot {
     } catch (error) {
       console.error('❌ 机器人初始化失败:', error)
       process.exit(1)
+    }
+  }
+
+  // 初始化机器人资料
+  async initBotProfile() {
+    try {
+      const me = await this.bot.getMe()
+      this.botId = me.id
+      this.botUsername = me.username || ''
+      console.log(`🤖 机器人用户名: @${this.botUsername || '未知'}`)
+    } catch (error) {
+      console.error('❌ 获取机器人资料失败:', error)
+      throw error
     }
   }
 
@@ -454,6 +504,213 @@ class TelegramRSSBot {
     }
   }
 
+  // 检查消息是否艾特了机器人
+  isBotMentioned(msg) {
+    if (!msg || !msg.text || !this.botUsername) return false
+
+    const mentionText = `@${this.botUsername}`.toLowerCase()
+    if (!Array.isArray(msg.entities)) {
+      return msg.text.toLowerCase().includes(mentionText)
+    }
+
+    return msg.entities.some(entity => {
+      if (entity.type === 'mention') {
+        const mention = msg.text
+          .slice(entity.offset, entity.offset + entity.length)
+          .toLowerCase()
+        return mention === mentionText
+      }
+      if (entity.type === 'text_mention') {
+        return !!this.botId && entity.user && entity.user.id === this.botId
+      }
+      return false
+    })
+  }
+
+  // 提取艾特后面的提问内容
+  extractMentionPrompt(msg) {
+    if (!msg || !msg.text || !this.botUsername) return ''
+    const mentionPattern = new RegExp(`@${this.botUsername}`, 'ig')
+    return msg.text.replace(mentionPattern, '').trim()
+  }
+
+  // 调用 Ollama 聊天接口
+  async chatWithOllama(prompt) {
+    const endpoint = this.ollamaApiUrl.replace(/\/$/, '') + '/api/chat'
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), this.ollamaTimeoutMs)
+
+    try {
+      const messages = []
+      if (this.ollamaSystemPrompt) {
+        messages.push({
+          role: 'system',
+          content: this.ollamaSystemPrompt
+        })
+      }
+      messages.push({ role: 'user', content: prompt })
+
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: this.ollamaModel,
+          stream: false,
+          messages
+        }),
+        signal: controller.signal
+      })
+
+      if (!response.ok) {
+        const errorText = await response.text()
+        throw new Error(`HTTP ${response.status}: ${errorText}`)
+      }
+
+      const data = await response.json()
+      const content = data && data.message ? data.message.content : ''
+      if (!content) {
+        throw new Error('Ollama 返回内容为空')
+      }
+
+      return content.trim()
+    } finally {
+      clearTimeout(timeoutId)
+    }
+  }
+
+  // 处理群组内艾特聊天
+  async handleMentionMessage(
+    msg,
+    promptOverride = '',
+    skipMentionCheck = false
+  ) {
+    if (!this.ollamaEnabled) return
+    if (!msg || !msg.chat || msg.chat.type === 'private') return
+    if (!msg.text || msg.from?.is_bot) return
+
+    const chatId = msg.chat.id.toString()
+    if (!this.groupIds.includes(chatId)) return
+    if (!skipMentionCheck && !this.isBotMentioned(msg)) return
+
+    let prompt = (promptOverride || this.extractMentionPrompt(msg)).trim()
+    if (!prompt) {
+      await this.bot.sendMessage(
+        msg.chat.id,
+        '请在艾特我后面输入想聊的内容，例如：@机器人 介绍一下这篇文章',
+        {
+          reply_to_message_id: msg.message_id
+        }
+      )
+      return
+    }
+
+    // 裁切提问内容，最多 300 字
+    prompt = cutTextByLength(prompt, 300)
+
+    await this.enqueueOllamaTask(msg, prompt)
+  }
+
+  // 加入 Ollama 串行队列（最多 50 个排队）
+  async enqueueOllamaTask(msg, prompt) {
+    if (this.ollamaQueue.length >= this.ollamaQueueMaxSize) {
+      await this.bot.sendMessage(
+        msg.chat.id,
+        '⏳ 当前问答排队已满（50），请稍后再试。',
+        {
+          reply_to_message_id: msg.message_id
+        }
+      )
+      return
+    }
+
+    this.ollamaQueue.push({ msg, prompt })
+    const pendingCount =
+      this.ollamaQueue.length + (this.isOllamaProcessing ? 1 : 0)
+
+    if (pendingCount > 1) {
+      await this.bot.sendMessage(
+        msg.chat.id,
+        `🕓 已加入问答队列，前面还有 ${pendingCount - 1} 个请求。`,
+        {
+          reply_to_message_id: msg.message_id
+        }
+      )
+    }
+
+    this.processOllamaQueue()
+  }
+
+  // 串行处理 Ollama 队列
+  async processOllamaQueue() {
+    if (this.isOllamaProcessing) return
+
+    this.isOllamaProcessing = true
+    console.log(
+      `🧠 开始处理 Ollama 队列，当前待处理: ${this.ollamaQueue.length}`
+    )
+
+    try {
+      while (this.ollamaQueue.length > 0 && !this.isStop) {
+        const task = this.ollamaQueue.shift()
+        const { msg, prompt } = task
+
+        try {
+          console.log(`💬 正在处理来自 ${msg.chat.id} 的提问...`)
+          await this.bot.sendChatAction(msg.chat.id, 'typing')
+          const answer = await this.chatWithOllama(prompt)
+          await this.bot.sendMessage(
+            msg.chat.id,
+            cutTextByLength(answer, 3800),
+            {
+              reply_to_message_id: msg.message_id,
+              disable_web_page_preview: true
+            }
+          )
+        } catch (error) {
+          console.error('❌ Ollama 聊天或发送失败:', error)
+          // 避免将大量 HTML 或超长错误信息直接发送到 Telegram（会触发 ETELEGRAM: message is too long）
+          let raw = error && error.message ? String(error.message) : '未知错误'
+          // 如果是 HTML 响应，截取摘要并提示可能被 Cloudflare/防护拦截
+          let safe = raw
+          if (/<!doctype html>|<html\b/i.test(raw) || raw.length > 1200) {
+            const statusMatch = raw.match(/^HTTP (\d+)/)
+            const status = statusMatch ? statusMatch[1] : ''
+            safe = status
+              ? `HTTP ${status} 返回 HTML 页面或响应过长，已省略详细内容。`
+              : '返回 HTML 页面或响应过长，已省略详细内容。'
+          } else {
+            safe = cutTextByLength(raw, 800)
+          }
+
+          try {
+            await this.bot.sendMessage(msg.chat.id, `❌ 聊天失败：${safe}`, {
+              reply_to_message_id: msg.message_id
+            })
+          } catch (sendError) {
+            console.error('❌ 发送错误通知到 Telegram 失败:', sendError)
+          }
+        }
+
+        // 每个任务之间增加 1 秒延迟，避免过快触发 API 限制
+        if (this.ollamaQueue.length > 0) {
+          await new Promise(resolve => setTimeout(resolve, 1000))
+        }
+      }
+    } catch (criticalError) {
+      console.error('❌ Ollama 队列处理循环发生严重错误:', criticalError)
+    } finally {
+      this.isOllamaProcessing = false
+      console.log('🧠 Ollama 队列处理结束')
+
+      // 检查是否在处理过程中又有新任务进入，且当前循环已结束
+      if (this.ollamaQueue.length > 0 && !this.isStop) {
+        setTimeout(() => this.processOllamaQueue(), 500)
+      }
+    }
+  }
+
   // 设置机器人命令
   setupBotCommands() {
     // 立即刷新指令
@@ -572,6 +829,15 @@ class TelegramRSSBot {
       }
     })
 
+    // 群组艾特聊天（按 Telegram message/entities 处理）
+    this.bot.on('message', async msg => {
+      try {
+        await this.handleMentionMessage(msg)
+      } catch (error) {
+        console.error('❌ 艾特消息处理失败:', error)
+      }
+    })
+
     // 错误处理
     this.bot.on('polling_error', error => {
       console.error('❌ Telegram轮询错误:', error)
@@ -609,6 +875,7 @@ class TelegramRSSBot {
     this.stopScheduler()
 
     this.isStop = true
+    this.ollamaQueue = []
 
     // 等待当前扫描完成
     // while (this.isScanning) {
