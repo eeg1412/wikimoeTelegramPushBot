@@ -592,13 +592,36 @@ class TelegramRSSBot {
 
     const chatId = msg.chat.id.toString()
     if (!this.groupIds.includes(chatId)) return
-    if (!skipMentionCheck && !this.isBotMentioned(msg)) return
 
-    let prompt = (promptOverride || this.extractMentionPrompt(msg)).trim()
-    if (!prompt) {
+    // 检查是否艾特了机器人或者回复了机器人的消息
+    const isBotMentioned = this.isBotMentioned(msg)
+    const isReplyToBot =
+      msg.reply_to_message &&
+      msg.reply_to_message.from &&
+      msg.reply_to_message.from.id === this.botId
+
+    if (!skipMentionCheck && !isBotMentioned && !isReplyToBot) return
+
+    let userPrompt = (promptOverride || this.extractMentionPrompt(msg)).trim()
+    let finalPrompt = userPrompt
+
+    // 如果是回复机器人的消息，把被引用的内容带上
+    if (
+      isReplyToBot &&
+      (msg.reply_to_message.text || msg.reply_to_message.caption)
+    ) {
+      const quotedText =
+        msg.reply_to_message.text || msg.reply_to_message.caption
+      // 构造一个新的 prompt，包含引用内容和用户回复
+      finalPrompt = `【引用内容】：\n${quotedText}\n\n【用户回复】：\n${
+        userPrompt || '请根据引用内容回复。'
+      }`
+    }
+
+    if (!finalPrompt && !isReplyToBot) {
       await this.bot.sendMessage(
         msg.chat.id,
-        '请在艾特我后面输入想聊的内容，例如：@机器人 介绍一下这篇文章',
+        '请在艾特我后面输入想聊的内容，或者直接回复我的消息，例如：@机器人 帮助我总结一下以上内容',
         {
           reply_to_message_id: msg.message_id
         }
@@ -606,10 +629,10 @@ class TelegramRSSBot {
       return
     }
 
-    // 裁切提问内容，最多 300 字
-    prompt = cutTextByLength(prompt, 300)
+    // 裁切提问内容，最多 1500 字（包含引用后适当增加上限）
+    finalPrompt = cutTextByLength(finalPrompt, 1500)
 
-    await this.enqueueOllamaTask(msg, prompt)
+    await this.enqueueOllamaTask(msg, finalPrompt)
   }
 
   // 加入 Ollama 串行队列（最多 50 个排队）
@@ -665,7 +688,8 @@ class TelegramRSSBot {
             cutTextByLength(answer, 3800),
             {
               reply_to_message_id: msg.message_id,
-              disable_web_page_preview: true
+              disable_web_page_preview: true,
+              parse_mode: 'Markdown'
             }
           )
         } catch (error) {
