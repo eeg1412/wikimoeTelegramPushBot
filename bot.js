@@ -72,6 +72,46 @@ const WMO_CODES = {
   99: '雷雨夹大冰雹'
 }
 
+// 月相计算 - 基于已知的新月日期计算
+function getMoonPhase(date) {
+  // 已知新月日期：2000-01-06 00:00:00 UTC
+  const knownNewMoonDate = new Date('2000-01-06T00:00:00Z')
+  const MOON_CYCLE = 29.53058867 // 月相周期（天）
+
+  // 计算距离已知新月的天数
+  const timeDiff = date - knownNewMoonDate
+  const daysSinceNewMoon = timeDiff / (1000 * 60 * 60 * 24)
+
+  // 计算在当前周期中的位置（0-29.53）
+  const cyclePosition = daysSinceNewMoon % MOON_CYCLE
+
+  // 根据周期位置判断月相
+  if (cyclePosition < 1.84) {
+    return { name: '🌑 新月', percentage: 0 }
+  } else if (cyclePosition < 7.38) {
+    const percent = Math.round(((cyclePosition - 1.84) / (7.38 - 1.84)) * 25)
+    return { name: '🌒 娥眉月', percentage: 5 + percent }
+  } else if (cyclePosition < 9.23) {
+    const percent = Math.round(((cyclePosition - 7.38) / (9.23 - 7.38)) * 25)
+    return { name: '🌓 上弦月', percentage: 30 + percent }
+  } else if (cyclePosition < 14.76) {
+    const percent = Math.round(((cyclePosition - 9.23) / (14.76 - 9.23)) * 25)
+    return { name: '🌔 盈凸月', percentage: 55 + percent }
+  } else if (cyclePosition < 16.61) {
+    const percent = Math.round(((cyclePosition - 14.76) / (16.61 - 14.76)) * 25)
+    return { name: '🌕 满月', percentage: 80 + percent }
+  } else if (cyclePosition < 22.15) {
+    const percent = Math.round(((cyclePosition - 16.61) / (22.15 - 16.61)) * 25)
+    return { name: '🌖 亏凸月', percentage: 100 - percent }
+  } else if (cyclePosition < 23.99) {
+    const percent = Math.round(((cyclePosition - 22.15) / (23.99 - 22.15)) * 25)
+    return { name: '🌗 下弦月', percentage: 50 - percent }
+  } else {
+    const percent = Math.round(((cyclePosition - 23.99) / (29.53 - 23.99)) * 25)
+    return { name: '🌘 残月', percentage: 25 - percent }
+  }
+}
+
 // Ollama 工具定义
 const OLLAMA_TOOLS = [
   {
@@ -84,17 +124,27 @@ const OLLAMA_TOOLS = [
         '\n1. 调用前需分析用户提到的地名所属国家，填写正确的 country_code 以避免同名城市歧义。' +
         '\n2. 查询类型由日期参数决定：' +
         '\n   • 当前天气：不指定任何日期参数' +
-        '\n   • 未来预报：只指定 forecast_days（1-16整数）' +
-        '\n   • 历史天气：必须同时指定 start_date 和 end_date' +
-        '\n【日期要求（历史查询必读）】' +
-        '\n• 日期格式必须为 YYYY-MM-DD（例：2024-03-01）' +
-        '\n• 历史数据范围：1940-01-01 至昨天（今天及未来日期无历史数据）' +
+        '\n   • 未来预报（简单）：只指定 forecast_days（1-16整数，1是今天，推荐用法）' +
+        '\n   • 未来预报（精确）：同时指定 start_date 和 end_date（必须都是未来日期）' +
+        '\n   • 历史天气：必须同时指定 start_date 和 end_date（都必须是过去日期）' +
+        '\n【日期格式要求】' +
+        '\n• 日期格式：YYYY-MM-DD（例：2026-02-26）' +
+        '\n• 今天日期：通过系统当前日期自动获取' +
+        '\n• 如果用户说"明天天气"或者"后天天气"，使用 forecast_days=7 (重要)' +
+        '\n【未来预报使用说明】' +
+        '\n• forecast_days 方式：forecast_days=3 返回未来 3 天预报，范围 1-16 天（推荐）' +
+        '\n• 精确范围方式：start_date 和 end_date 都必须是未来日期（>= 今天），最多可查未来 16 天' +
+        '\n• 例：start_date=2026-02-26&end_date=2026-03-01 查询 2 月 26 日至 3 月 1 日的预报' +
+        '\n【历史天气使用说明】' +
+        '\n• 必须同时指定 start_date 和 end_date，都必须是过去日期（< 今天）' +
+        '\n• 数据范围：1940-01-01 至昨天' +
         '\n• start_date 必须 <= end_date' +
-        '\n• 时间跨度建议不超过 1 个月，过长会降低效率' +
+        '\n• 时间跨度建议不超过 1 个月' +
         '\n【参数约束】' +
         '\n• 不能同时使用 forecast_days 与 start_date/end_date' +
         '\n• hourly/daily/current 参数可选，为空时使用默认字段' +
-        '\n• 历史查询默认返回 hourly（小时）数据，包含 weathercode 用于天气描述',
+        '\n• 历史查询默认返回 hourly（小时）数据，包含 weathercode 用于天气描述' +
+        '\n• 该工具只允许调用一次',
       parameters: {
         type: 'object',
         properties: {
@@ -110,17 +160,27 @@ const OLLAMA_TOOLS = [
           start_date: {
             type: 'string',
             description:
-              '开始日期 YYYY-MM-DD。查询历史天气时必须与 end_date 一起使用。范围：1940-01-01 至昨天。示例：2024-03-01'
+              '开始日期 YYYY-MM-DD，用途取决于日期值：' +
+              '\n• 历史数据：范围 1940-01-01 至昨天（必须是过去日期）' +
+              '\n• 未来预报：今天或未来日期，与 end_date 同时使用精确指定范围' +
+              '\n【示例】2026-02-26（未来）或 2024-03-01（过去）'
           },
           end_date: {
             type: 'string',
             description:
-              '结束日期 YYYY-MM-DD。必须 >= start_date。示例：2024-03-10'
+              '结束日期 YYYY-MM-DD，用途取决于日期值：' +
+              '\n• 历史数据：过去日期，必须 >= start_date' +
+              '\n• 未来预报：未来日期，必须 >= start_date，最多可指定未来 16 天' +
+              '\n【示例】2026-03-01（未来）或 2024-03-10（过去）'
           },
           forecast_days: {
             type: 'integer',
             description:
-              '预报未来天数（1-16的整数）。仅用于预报查询，不能与 start_date/end_date 同时使用'
+              '【推荐用法】预报未来天数，整数范围 1-16。' +
+              '\n• forecast_days=3 返回未来 3 天的预报' +
+              '\n• 无需指定 start_date/end_date，系统自动从今天开始计算' +
+              '\n• 不能与 start_date/end_date 同时使用' +
+              '\n【对比】要精确控制预报范围可用 start_date/end_date，但 forecast_days 更简单'
           },
           current: {
             type: 'array',
@@ -722,9 +782,73 @@ class TelegramRSSBot {
 
     // 2. 天气查询
     const today = new Date().toISOString().slice(0, 10)
-    const isHistory = start_date && start_date < today
 
-    // 3. 历史数据相关验证
+    // 判断查询类型
+    const isHistory = start_date && start_date < today
+    const isForecast =
+      forecast_days ||
+      (start_date && start_date >= today) ||
+      (end_date && end_date >= today)
+
+    // 3. 预报数据相关验证
+    if (isForecast && !isHistory) {
+      // 检查不能同时使用两种预报方式
+      if (forecast_days && (start_date || end_date)) {
+        throw new Error(
+          '不能同时使用 forecast_days 与 start_date/end_date，请选择其中一种方式'
+        )
+      }
+
+      if (forecast_days) {
+        // 方式1：使用 forecast_days
+        if (forecast_days < 1 || forecast_days > 16) {
+          throw new Error('forecast_days 必须是 1-16 之间的整数')
+        }
+      } else if (start_date || end_date) {
+        // 方式2：使用 start_date/end_date 精确指定范围
+        if (!start_date || !end_date) {
+          throw new Error(
+            '预报查询必须同时指定 start_date 和 end_date（格式：YYYY-MM-DD）'
+          )
+        }
+
+        // 验证日期格式
+        const dateRegex = /^\d{4}-\d{2}-\d{2}$/
+        if (!dateRegex.test(start_date) || !dateRegex.test(end_date)) {
+          throw new Error('日期格式必须为 YYYY-MM-DD，例如：2026-02-26')
+        }
+
+        // 验证日期逻辑
+        if (start_date > end_date) {
+          throw new Error('start_date 不能大于 end_date')
+        }
+
+        // 验证都是未来日期
+        if (start_date < today) {
+          throw new Error(
+            `start_date 必须是未来日期（>= ${today}），历史数据应使用 start_date < 今天`
+          )
+        }
+        if (end_date < today) {
+          throw new Error(
+            `end_date 必须是未来日期（>= ${today}），历史数据应使用 end_date < 今天`
+          )
+        }
+
+        // 验证预报范围不超过 16 天
+        const startDate = new Date(start_date)
+        const endDate = new Date(end_date)
+        const daysDiff =
+          Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24)) + 1
+        if (daysDiff > 16) {
+          throw new Error(
+            `预报范围最多 16 天，你指定的范围是 ${daysDiff} 天，请缩小日期范围`
+          )
+        }
+      }
+    }
+
+    // 4. 历史数据相关验证
     if (isHistory) {
       // 历史查询必须同时有 start_date 和 end_date
       if (!start_date || !end_date) {
@@ -784,6 +908,9 @@ class TelegramRSSBot {
           'hourly',
           'temperature_2m,precipitation,weathercode'
         )
+      } else if (isForecast) {
+        // 未来预报：返回 daily 数据（包含 weathercode 以获取天气描述）
+        url.searchParams.set('daily', 'weathercode,temperature_2m_max')
       } else {
         // 当前或预报：使用 current_weather
         url.searchParams.set('current_weather', 'true')
@@ -868,7 +995,16 @@ class TelegramRSSBot {
     if (weatherData.current_weather) {
       const c = weatherData.current_weather
       lines.push('*📊 当前天气*')
-      if (c.time !== undefined) lines.push(`🕐 时间：${fmtTime(c.time)}`)
+      if (c.time !== undefined) {
+        lines.push(`🕐 时间：${fmtTime(c.time)}`)
+        // 计算当天月相
+        const dateStr = String(c.time).slice(0, 10) // 提取 YYYY-MM-DD
+        const dateObj = new Date(dateStr + 'T00:00:00Z')
+        const moonPhase = getMoonPhase(dateObj)
+        const [moonEmoji, ...moonNameParts] = moonPhase.name.split(' ')
+        const moonNameOnly = moonNameParts.join(' ')
+        lines.push(`${moonEmoji} 月相：${moonNameOnly}`)
+      }
       if (c.temperature !== undefined)
         lines.push(`🌡️ 气温：${c.temperature} °C`)
       if (c.weathercode !== undefined)
@@ -887,7 +1023,16 @@ class TelegramRSSBot {
     if (weatherData.current) {
       const c = weatherData.current
       lines.push('*📊 当前天气*')
-      if (c.time !== undefined) lines.push(`🕐 时间：${fmtTime(c.time)}`)
+      if (c.time !== undefined) {
+        lines.push(`🕐 时间：${fmtTime(c.time)}`)
+        // 计算当天月相
+        const dateStr = String(c.time).slice(0, 10) // 提取 YYYY-MM-DD
+        const dateObj = new Date(dateStr + 'T00:00:00Z')
+        const moonPhase = getMoonPhase(dateObj)
+        const [moonEmoji, ...moonNameParts] = moonPhase.name.split(' ')
+        const moonNameOnly = moonNameParts.join(' ')
+        lines.push(`${moonEmoji} 月相：${moonNameOnly}`)
+      }
       if (c.temperature_2m !== undefined)
         lines.push(`🌡️ 气温：${c.temperature_2m} °C`)
       if (c.apparent_temperature !== undefined)
@@ -922,7 +1067,11 @@ class TelegramRSSBot {
       if (times.length > 0) {
         lines.push('*📅 逐日天气*')
         times.forEach((date, i) => {
-          const parts = [`📆 ${date}`]
+          // 计算月相
+          const dateObj = new Date(date + 'T00:00:00Z')
+          const moonPhase = getMoonPhase(dateObj)
+
+          const parts = [`📆 ${date}  ${moonPhase.name}`]
           if (d.weathercode?.[i] !== undefined)
             parts.push(`${wmo(d.weathercode[i])}`)
           if (d.temperature_2m_max?.[i] !== undefined)
